@@ -1,11 +1,14 @@
-junior/junior+ AI Product Engineer / ML Developer
-Python, FastAPI, Docker, backend
-LLM/RAG/microservices
-интересны end-to-end AI systems
-интересны ML backend / applied ML / AI product roles
-менее интересны:
-чистый analyst
-pure frontend
-pure Java enterprise
-hard research-only roles без инженерной части
-pure CV/embedded/C++ если стек совсем мимо
+Кандидат: AI Product Engineer / ML Developer.
+
+Сильные стороны:
+ Python, SQL, pandas, Numpy, Scikit-learn, CatBoost, LightGBM, TensorFlow, Docker, Git, Linux, FastAPI, Flask, RAG, LLM, Prompt Engineering, Docker Compose
+
+Ключевые компетенции:
+- Backend & DevOps: Проектирование микросервисов (FastAPI/Flask), контейнеризация
+(Docker, Docker Compose), администрирование Linux-серверов.
+- Machine Learning: Полный цикл разработки моделей и их инференс (EDA, Feature
+Engineering, обучение CatBoost/LightGBM, валидация бизнес-метрик, упаковка в Docker и
+реализация API на Flask).
+- Product Mindset: Опыт руководства командой (5 человек) и запуска сложных IT-продуктов
+для крупных государственных и коммерческих заказчиков (Мосгортранс, Газэнергострой и
+др.).
