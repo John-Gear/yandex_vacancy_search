@@ -4,19 +4,20 @@ import json
 import time
 import sqlite3
 import hashlib
-from datetime import datetime
+from html import unescape
+from datetime import datetime, timezone
 from urllib.parse import quote_plus, urljoin
 
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from flask import Flask, request, redirect, url_for, render_template_string
-from datetime import datetime, timezone
+from flask import Flask, render_template_string
 
 load_dotenv()
 
 BASE_URL = "https://yandex.ru"
 SEARCH_URL = "https://yandex.ru/jobs/vacancies?text={query}"
+PUBLICATIONS_API_URL = "https://yandex.ru/jobs/api/publications"
 
 HEADERS = {
     "User-Agent": (
@@ -37,6 +38,7 @@ MAX_RESULTS_PER_KEYWORD = int(os.getenv("MAX_RESULTS_PER_KEYWORD", "50"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.0"))
 LLM_BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE", "10"))
 REPORT_MIN_SCORE = int(os.getenv("REPORT_MIN_SCORE", "7"))
+API_PAGE_SIZE = int(os.getenv("API_PAGE_SIZE", "20"))
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
@@ -100,10 +102,18 @@ def now_iso() -> str:
 
 def clean_text(text: str) -> str:
     text = text or ""
+    text = unescape(text)
     text = re.sub(r"\r", "\n", text)
-    text = re.sub(r"\n\s*\n+", "\n\n", text)
     text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
     return text.strip()
+
+
+def strip_html(text: str) -> str:
+    text = text or ""
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return clean_text(text)
 
 
 def content_hash(title: str, description: str) -> str:
@@ -136,65 +146,20 @@ def fetch_html(session: requests.Session, url: str) -> str:
     return resp.text
 
 
+def fetch_json(session: requests.Session, url: str, params: dict | None = None) -> dict:
+    resp = session.get(url, headers=HEADERS, params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
 # -----------------------------
 # Parsing
 # -----------------------------
-def parse_search_page(html: str) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    items = []
-    seen = set()
-
-    cards = soup.select(".lc-jobs-vacancy-card")
-    for card in cards:
-        link = card.find("a", href=True)
-        if not link:
-            continue
-        href = link["href"].strip()
-        if not href.startswith("/jobs/vacancies/"):
-            continue
-
-        full_url = urljoin(BASE_URL, href)
-        if full_url in seen:
-            continue
-        seen.add(full_url)
-
-        title = clean_text(link.get_text(" ", strip=True))
-        if not title:
-            title = "Без названия"
-
-        items.append({
-            "url": full_url,
-            "title": title,
-        })
-
-    # fallback
-    if not items:
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            if not href.startswith("/jobs/vacancies/"):
-                continue
-            full_url = urljoin(BASE_URL, href)
-            if full_url in seen:
-                continue
-            seen.add(full_url)
-            title = clean_text(a.get_text(" ", strip=True)) or "Без названия"
-            items.append({
-                "url": full_url,
-                "title": title,
-            })
-
-    return items
-
-
 def remove_benefits_block(text: str) -> str:
-    """
-    Мягко отрезаем блоки типа 'Что мы предлагаем', если они есть.
-    """
     patterns = [
         r"\nЧто мы предлагаем[\s\S]*$",
         r"\nМы предлагаем[\s\S]*$",
         r"\nУсловия[\s\S]*$",
-        r"\nБудет плюсом[\s\S]*$",
     ]
     result = text
     for pattern in patterns:
@@ -219,7 +184,6 @@ def parse_vacancy_page(html: str, url: str, keyword: str) -> dict:
             description_parts.append(txt)
 
     if not description_parts:
-        # fallback: берем длинный текст из main/article/section/div
         candidates = []
         for tag in soup.find_all(["main", "article", "section", "div"]):
             txt = clean_text(tag.get_text(" ", strip=True))
@@ -242,26 +206,57 @@ def parse_vacancy_page(html: str, url: str, keyword: str) -> dict:
 
 def fetch_jobs_for_keyword(session: requests.Session, keyword: str, limit: int) -> list[dict]:
     """
-    Пока без сложной пагинации: берем то, что есть на текущей выдаче,
-    потом обрежем до limit.
+    Тянем вакансии через внутренний JSON API, который использует сайт
+    при infinite scroll.
     """
-    search_url = SEARCH_URL.format(query=quote_plus(keyword))
-    html = fetch_html(session, search_url)
-    cards = parse_search_page(html)
-    return cards[:limit]
+    items = []
+    seen = set()
+
+    next_url = PUBLICATIONS_API_URL
+    params = {
+        "page_size": API_PAGE_SIZE,
+        "text": keyword,
+    }
+
+    while next_url and len(items) < limit:
+        data = fetch_json(session, next_url, params=params)
+        params = None  # дальше next уже содержит все параметры
+
+        for row in data.get("results", []):
+            slug = row.get("publication_slug_url")
+            if not slug:
+                continue
+
+            url = urljoin(BASE_URL, f"/jobs/vacancies/{slug}")
+            if url in seen:
+                continue
+            seen.add(url)
+
+            title = strip_html(row.get("title") or "") or "Без названия"
+
+            items.append({
+                "url": url,
+                "title": title,
+            })
+
+            if len(items) >= limit:
+                break
+
+        next_url = data.get("next")
+        if next_url and next_url.startswith("http://femida.yandex-team.ru/_api/jobs/publications/"):
+            # На всякий случай нормализуем внутренний next URL к публичному домену
+            next_url = next_url.replace(
+                "http://femida.yandex-team.ru/_api/jobs/publications/",
+                "https://yandex.ru/jobs/api/publications"
+            )
+
+    return items[:limit]
 
 
 # -----------------------------
 # DB Ops
 # -----------------------------
-def get_existing_jobs_map() -> dict[str, sqlite3.Row]:
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM jobs").fetchall()
-    conn.close()
-    return {row["url"]: row for row in rows}
-
-
-def upsert_job(job: dict):
+def upsert_job(job: dict) -> str:
     conn = get_conn()
     cur = conn.cursor()
 
@@ -277,6 +272,10 @@ def upsert_job(job: dict):
         new_keywords = set(job.get("matched_keywords", []))
         merged_keywords = sorted(existing_keywords | new_keywords)
 
+        changed = False
+        if set(merged_keywords) != existing_keywords:
+            changed = True
+
         cur.execute("""
             UPDATE jobs
             SET matched_keywords = ?, last_seen_at = ?
@@ -286,26 +285,30 @@ def upsert_job(job: dict):
             current_time,
             job["url"]
         ))
-    else:
-        cur.execute("""
-            INSERT INTO jobs (
-                url, title, keyword, matched_keywords, description,
-                content_hash, first_seen_at, last_seen_at, is_processed
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-        """, (
-            job["url"],
-            job["title"],
-            job["keyword"],
-            json.dumps(job.get("matched_keywords", []), ensure_ascii=False),
-            job["description"],
-            content_hash(job["title"], job["description"]),
-            current_time,
-            current_time,
-        ))
+        conn.commit()
+        conn.close()
+        return "updated" if changed else "existing"
+
+    cur.execute("""
+        INSERT INTO jobs (
+            url, title, keyword, matched_keywords, description,
+            content_hash, first_seen_at, last_seen_at, is_processed
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+    """, (
+        job["url"],
+        job["title"],
+        job["keyword"],
+        json.dumps(job.get("matched_keywords", []), ensure_ascii=False),
+        job["description"],
+        content_hash(job["title"], job["description"]),
+        current_time,
+        current_time,
+    ))
 
     conn.commit()
     conn.close()
+    return "inserted"
 
 
 def remove_jobs_not_in_search(active_urls: set[str]):
@@ -394,7 +397,7 @@ def save_llm_results(results: list[dict]):
 # -----------------------------
 # OpenRouter
 # -----------------------------
-def build_llm_payload(batch_jobs: list[sqlite3.Row], profile: str, system_prompt: str) -> list[dict]:
+def build_llm_payload(batch_jobs: list[sqlite3.Row]) -> list[dict]:
     jobs_for_prompt = []
     for row in batch_jobs:
         jobs_for_prompt.append({
@@ -413,7 +416,7 @@ def call_openrouter(batch_jobs: list[sqlite3.Row]) -> list[dict]:
     profile = read_text_file(PROFILE_PATH)
     system_prompt = read_text_file(SYSTEM_PROMPT_PATH)
 
-    jobs_payload = build_llm_payload(batch_jobs, profile, system_prompt)
+    jobs_payload = build_llm_payload(batch_jobs)
 
     user_prompt = f"""
 Профиль кандидата:
@@ -450,8 +453,6 @@ def call_openrouter(batch_jobs: list[sqlite3.Row]) -> list[dict]:
     data = resp.json()
 
     content = data["choices"][0]["message"]["content"].strip()
-
-    # На случай если модель обернет JSON в ```json
     content = re.sub(r"^```json\s*", "", content, flags=re.IGNORECASE)
     content = re.sub(r"^```\s*", "", content)
     content = re.sub(r"\s*```$", "", content)
@@ -471,8 +472,11 @@ def run_parser() -> dict:
     keywords = get_keywords()
 
     active_urls = set()
-    found_count = 0
-    added_or_updated = 0
+    cards_seen_total = 0
+    unique_urls_seen = 0
+    new_jobs_added = 0
+    existing_jobs_seen = 0
+    updated_jobs_seen = 0
 
     for keyword in keywords:
         try:
@@ -481,17 +485,29 @@ def run_parser() -> dict:
             print(f"[ERROR] keyword={keyword}: {e}")
             continue
 
+        cards_seen_total += len(cards)
+
         for card in cards:
             url = card["url"]
+            is_new_url_for_run = url not in active_urls
             active_urls.add(url)
 
             try:
                 time.sleep(REQUEST_DELAY)
                 html = fetch_html(session, url)
                 job = parse_vacancy_page(html, url, keyword)
-                upsert_job(job)
-                found_count += 1
-                added_or_updated += 1
+                status = upsert_job(job)
+
+                if is_new_url_for_run:
+                    unique_urls_seen += 1
+
+                if status == "inserted":
+                    new_jobs_added += 1
+                elif status == "updated":
+                    updated_jobs_seen += 1
+                else:
+                    existing_jobs_seen += 1
+
             except Exception as e:
                 print(f"[ERROR] vacancy={url}: {e}")
 
@@ -500,8 +516,11 @@ def run_parser() -> dict:
 
     return {
         "keywords": keywords,
-        "found_count": found_count,
-        "added_or_updated": added_or_updated,
+        "cards_seen_total": cards_seen_total,
+        "unique_urls_seen": unique_urls_seen,
+        "new_jobs_added": new_jobs_added,
+        "existing_jobs_seen": existing_jobs_seen,
+        "updated_jobs_seen": updated_jobs_seen,
         "removed_closed": removed_closed,
         "removed_blacklist": removed_blacklist,
     }
@@ -594,10 +613,21 @@ HTML = """
   <title>Job Hunter MVP</title>
   <style>
     body { font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; line-height: 1.5; }
-    h1 { margin-bottom: 24px; }
+    h1 { margin-bottom: 12px; }
+    .status-wrap { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      border: 1px solid #ddd;
+      border-radius: 999px;
+      background: #fafafa;
+    }
     .buttons { display: flex; gap: 12px; margin-bottom: 24px; flex-wrap: wrap; }
     form { display: inline; }
     button { padding: 12px 18px; cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: 0.6; }
     .box {
       background: #f6f6f6;
       border: 1px solid #ddd;
@@ -607,21 +637,43 @@ HTML = """
     }
     table { border-collapse: collapse; width: 100%; margin-top: 24px; }
     th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+    .spinner {
+      width: 16px;
+      height: 16px;
+      border: 2px solid #ddd;
+      border-top-color: #333;
+      border-radius: 50%;
+      display: none;
+      animation: spin 0.8s linear infinite;
+    }
+    .spinner.active { display: inline-block; }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    .muted { color: #666; }
   </style>
 </head>
 <body>
   <h1>Job Hunter MVP</h1>
 
+  <div class="status-wrap">
+    <div class="status-pill">
+      <span id="spinner" class="spinner"></span>
+      <span id="status-text">Статус: готов</span>
+    </div>
+    <span class="muted">Во время выполнения кнопки блокируются</span>
+  </div>
+
   <div class="buttons">
-    <form method="post" action="/run-parser">
+    <form method="post" action="/run-parser" data-status="Идет парсинг вакансий...">
       <button type="submit">1. Запустить парсер</button>
     </form>
 
-    <form method="post" action="/run-llm">
+    <form method="post" action="/run-llm" data-status="Идет обработка вакансий через LLM...">
       <button type="submit">2. Запустить обработку LLM</button>
     </form>
 
-    <form method="post" action="/build-report">
+    <form method="post" action="/build-report" data-status="Формируется отчет...">
       <button type="submit">3. Сформировать отчет</button>
     </form>
   </div>
@@ -640,6 +692,21 @@ HTML = """
     <tr><td>Необработанных LLM</td><td>{{ stats.unprocessed_count }}</td></tr>
     <tr><td>Обработанных LLM</td><td>{{ stats.processed_count }}</td></tr>
   </table>
+
+  <script>
+    const forms = document.querySelectorAll("form[data-status]");
+    const buttons = document.querySelectorAll("button");
+    const spinner = document.getElementById("spinner");
+    const statusText = document.getElementById("status-text");
+
+    forms.forEach(form => {
+      form.addEventListener("submit", () => {
+        buttons.forEach(btn => btn.disabled = true);
+        spinner.classList.add("active");
+        statusText.textContent = "Статус: " + form.dataset.status;
+      });
+    });
+  </script>
 </body>
 </html>
 """
@@ -669,7 +736,11 @@ def run_parser_route():
     msg = (
         f"Парсер завершен.\n"
         f"Ключи: {', '.join(result['keywords'])}\n"
-        f"Найдено/обновлено: {result['found_count']}\n"
+        f"Обработано карточек: {result['cards_seen_total']}\n"
+        f"Уникальных URL в выдаче: {result['unique_urls_seen']}\n"
+        f"Новых вакансий добавлено: {result['new_jobs_added']}\n"
+        f"Уже существовали: {result['existing_jobs_seen']}\n"
+        f"Обновлены matched_keywords: {result['updated_jobs_seen']}\n"
         f"Удалено закрытых: {result['removed_closed']}\n"
         f"Удалено по blacklist: {result['removed_blacklist']}"
     )
