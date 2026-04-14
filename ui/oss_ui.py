@@ -46,25 +46,17 @@ OSS_UI_HTML = '''
   </style>
 </head>
 <body>
-  <h1>Job Hunter OSS UI</h1>
-
-  <div class="status-wrap">
-    <div class="status-pill">
-      <span id="spinner" class="spinner"></span>
-      <span id="status-text">Статус: готов</span>
-    </div>
-    <span class="muted">Эта морда работает только через API</span>
-  </div>
+  <h1>AI vacancy search</h1>
 
   <div class="buttons">
-    <button data-url="/api/parsers/yandex/run" data-status="Идет парсинг вакансий...">1. Запустить парсер</button>
+    <button data-url="/api/parsers/yandex/run" data-status="Идет парсинг вакансий...">1. Спарсить вакансии</button>
     <button data-url="/api/llm/run" data-status="Идет обработка вакансий через LLM...">2. Запустить обработку LLM</button>
     <button data-url="/api/report/build" data-status="Формируется отчет...">3. Сформировать отчет</button>
   </div>
 
   <div id="message" class="box" style="display:none;"></div>
 
-  <h2>Сводка по базе</h2>
+  <h2>Отчет:</h2>
   <table>
     <tr><th>Показатель</th><th>Значение</th></tr>
     <tr><td>Всего вакансий</td><td id="jobs_count">—</td></tr>
